@@ -3,29 +3,25 @@ import zipfile, io, re, unicodedata
 import pandas as pd
 from bs4 import BeautifulSoup
 
-# 선택적 인코딩 탐지 라이브러리
+# 선택적 인코딩 탐지
 try:
     import chardet
 except ImportError:
     chardet = None
 
-# ----------------------------------
-# 기본 설정
-# ----------------------------------
+# =============== 기본 설정 ===============
 st.set_page_config(page_title="XML 키워드 검색기", page_icon="🔍", layout="wide")
-st.title("🔍 XML ZIP 문서 키워드 검색기 (재귀 ZIP 지원 버전)")
+st.title("🔍 XML ZIP 문서 키워드 검색기 (재귀 ZIP + DART 링크)")
 
 st.markdown("""
-업로드한 ZIP 파일 안의 XML/HTML 문서를 모두 분석해,  
-**입력한 키워드가 포함된 문서**를 찾아 표시합니다.  
-(※ ZIP 안에 또 ZIP이 들어있어도 모두 자동 탐색합니다)
+업로드한 ZIP 파일(중첩 ZIP 포함)에서 XML/HTML/TXT를 분석해  
+입력한 **키워드**가 포함된 문서를 찾고, 가능하면 **DART 원문 링크**까지 제공합니다.
 """)
 
-# ----------------------------------
-# 텍스트 추출 함수
-# ----------------------------------
+DART_BASE = "https://dart.fss.or.kr/dsaf001/main.do?rcpNo="
+
+# =============== 유틸: 인코딩/텍스트 추출 ===============
 def try_decode(raw: bytes) -> str:
-    """여러 인코딩 시도로 안전하게 문자열 디코딩"""
     for enc in ("utf-8", "utf-8-sig", "cp949", "euc-kr"):
         try:
             return raw.decode(enc)
@@ -42,7 +38,6 @@ def try_decode(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 def extract_text(file_bytes: bytes) -> str:
-    """XML/HTML/TXT 등에서 텍스트를 추출"""
     txt = try_decode(file_bytes)
     soup = None
     for parser in ("lxml-xml", "lxml", "html.parser"):
@@ -62,36 +57,58 @@ def extract_text(file_bytes: bytes) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-# ----------------------------------
-# 재귀 ZIP 탐색 함수
-# ----------------------------------
+# =============== 유틸: rcpNo(접수번호) 추출 ===============
+_rcpno_pat = re.compile(r"(?:<rcept_no>\s*(20\d{12})\s*</rcept_no>)|(?:\b(20\d{12})\b)", re.IGNORECASE)
+
+def find_rcpno_from_path(path: str) -> str | None:
+    # 경로/파일명에서 14자리 접수번호 찾기 (2000년대 형식 가정)
+    m = re.search(r"\b(20\d{12})\b", path)
+    return m.group(1) if m else None
+
+def find_rcpno_from_text(text: str) -> str | None:
+    # <rcept_no>2023... </rcept_no> 또는 그냥 14자리 숫자
+    m = _rcpno_pat.search(text)
+    if not m:
+        return None
+    return m.group(1) or m.group(2)
+
+def make_dart_link(rcpno: str | None) -> str:
+    return f"{DART_BASE}{rcpno}" if rcpno else ""
+
+# =============== 재귀 ZIP 탐색 ===============
 def extract_texts_from_zip(zf_bytes, keywords, results, parent=""):
-    """ZIP 파일 내부의 XML/HTML 파일과 중첩 ZIP까지 재귀 탐색"""
     try:
         with zipfile.ZipFile(io.BytesIO(zf_bytes), "r") as zf:
             for name in zf.namelist():
                 path = f"{parent}/{name}" if parent else name
-                # 내부 ZIP 재귀 탐색
+
+                # 내부 ZIP → 재귀
                 if name.lower().endswith(".zip"):
                     try:
                         inner_bytes = zf.read(name)
                         extract_texts_from_zip(inner_bytes, keywords, results, parent=path)
                     except Exception:
                         continue
-                # XML/HTML 파일 텍스트 추출
+
+                # 대상 확장자
                 elif name.lower().endswith((".xml", ".xbrl", ".htm", ".html", ".txt")):
                     try:
                         raw = zf.read(name)
                     except Exception:
                         continue
+
                     text_content = extract_text(raw)
                     if not text_content:
                         continue
 
+                    # rcpNo 추출 (우선순위: 경로 → 본문)
+                    rcpno = find_rcpno_from_path(path) or find_rcpno_from_text(text_content)
+                    dart_link = make_dart_link(rcpno)
+
                     found_words, snippets = [], []
                     for kw in keywords:
-                        pattern = re.compile(r".{0,50}" + re.escape(kw) + r".{0,50}", re.IGNORECASE)
-                        matches = pattern.findall(text_content)
+                        pat = re.compile(r".{0,50}" + re.escape(kw) + r".{0,50}", re.IGNORECASE)
+                        matches = pat.findall(text_content)
                         if matches:
                             found_words.append(kw)
                             for m in matches[:3]:
@@ -100,19 +117,17 @@ def extract_texts_from_zip(zf_bytes, keywords, results, parent=""):
                     if found_words:
                         results.append({
                             "파일경로": path,
-                            "일치 키워드": ", ".join(found_words),
+                            "일치 키워드": ", ".join(sorted(set(found_words))),
                             "일치 횟수": len(snippets),
-                            "문장 일부": "\n".join(snippets)
+                            "문장 일부": "\n".join(snippets),
+                            "DART링크": dart_link
                         })
     except zipfile.BadZipFile:
         pass
 
-# ----------------------------------
-# Streamlit UI
-# ----------------------------------
+# =============== UI ===============
 uploaded_file = st.file_uploader("📂 ZIP 파일 업로드", type=["zip"])
 keywords_input = st.text_input("🔎 검색할 키워드 (쉼표로 구분 가능)", placeholder="예: 임원, ESG, 품질, 지속가능")
-
 search_button = st.button("검색 시작 🔍")
 
 if search_button:
@@ -123,21 +138,28 @@ if search_button:
     else:
         keywords = [kw.strip() for kw in keywords_input.split(",") if kw.strip()]
         results = []
-        progress = st.progress(0, text="ZIP 구조 탐색 중...")
-
         try:
             file_bytes = uploaded_file.read()
             extract_texts_from_zip(file_bytes, keywords, results)
         except Exception as e:
-            st.error(f"ZIP 파일을 읽는 중 오류 발생: {e}")
+            st.error(f"ZIP 처리 중 오류: {e}")
 
-        # ----------------------------------
-        # 결과 표시
-        # ----------------------------------
         if results:
             df = pd.DataFrame(results)
+
             st.success(f"✅ 총 {len(df)}개 문서에서 키워드 발견")
-            st.dataframe(df, use_container_width=True)
+            st.dataframe(
+                df,
+                use_container_width=True,
+                column_config={
+                    "파일경로": st.column_config.TextColumn("파일 경로", width="medium"),
+                    "일치 키워드": st.column_config.TextColumn("일치 키워드"),
+                    "일치 횟수": st.column_config.NumberColumn("일치 횟수"),
+                    "문장 일부": st.column_config.TextColumn("문장 일부", width="large"),
+                    # ✅ 클릭 가능한 링크
+                    "DART링크": st.column_config.LinkColumn("DART 보고서", display_text="바로보기")
+                }
+            )
 
             csv = df.to_csv(index=False).encode("utf-8-sig")
             st.download_button(

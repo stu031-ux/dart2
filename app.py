@@ -1,29 +1,31 @@
 import streamlit as st
-import zipfile, re, unicodedata
+import zipfile, io, re, unicodedata
 import pandas as pd
 from bs4 import BeautifulSoup
 
-# 선택적 인코딩 탐지
+# 선택적 인코딩 탐지 라이브러리
 try:
     import chardet
 except ImportError:
     chardet = None
 
-# ------------------------------
-# 페이지 설정
-# ------------------------------
+# ----------------------------------
+# 기본 설정
+# ----------------------------------
 st.set_page_config(page_title="XML 키워드 검색기", page_icon="🔍", layout="wide")
-st.title("🔍 XML ZIP 문서 키워드 검색기")
+st.title("🔍 XML ZIP 문서 키워드 검색기 (재귀 ZIP 지원 버전)")
 
 st.markdown("""
-ZIP 파일 안의 XML/HTML 문서들을 분석해 **사용자가 입력한 키워드**가 포함된 문서를 찾아줍니다.  
-예: `임원`, `ESG`, `품질`, `지속가능`, `반도체` 등 자유롭게 검색 가능  
+업로드한 ZIP 파일 안의 XML/HTML 문서를 모두 분석해,  
+**입력한 키워드가 포함된 문서**를 찾아 표시합니다.  
+(※ ZIP 안에 또 ZIP이 들어있어도 모두 자동 탐색합니다)
 """)
 
-# ------------------------------
-# 텍스트 추출 유틸리티
-# ------------------------------
+# ----------------------------------
+# 텍스트 추출 함수
+# ----------------------------------
 def try_decode(raw: bytes) -> str:
+    """여러 인코딩 시도로 안전하게 문자열 디코딩"""
     for enc in ("utf-8", "utf-8-sig", "cp949", "euc-kr"):
         try:
             return raw.decode(enc)
@@ -40,6 +42,7 @@ def try_decode(raw: bytes) -> str:
     return raw.decode("utf-8", errors="replace")
 
 def extract_text(file_bytes: bytes) -> str:
+    """XML/HTML/TXT 등에서 텍스트를 추출"""
     txt = try_decode(file_bytes)
     soup = None
     for parser in ("lxml-xml", "lxml", "html.parser"):
@@ -59,17 +62,59 @@ def extract_text(file_bytes: bytes) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-# ------------------------------
-# UI 구성
-# ------------------------------
+# ----------------------------------
+# 재귀 ZIP 탐색 함수
+# ----------------------------------
+def extract_texts_from_zip(zf_bytes, keywords, results, parent=""):
+    """ZIP 파일 내부의 XML/HTML 파일과 중첩 ZIP까지 재귀 탐색"""
+    try:
+        with zipfile.ZipFile(io.BytesIO(zf_bytes), "r") as zf:
+            for name in zf.namelist():
+                path = f"{parent}/{name}" if parent else name
+                # 내부 ZIP 재귀 탐색
+                if name.lower().endswith(".zip"):
+                    try:
+                        inner_bytes = zf.read(name)
+                        extract_texts_from_zip(inner_bytes, keywords, results, parent=path)
+                    except Exception:
+                        continue
+                # XML/HTML 파일 텍스트 추출
+                elif name.lower().endswith((".xml", ".xbrl", ".htm", ".html", ".txt")):
+                    try:
+                        raw = zf.read(name)
+                    except Exception:
+                        continue
+                    text_content = extract_text(raw)
+                    if not text_content:
+                        continue
+
+                    found_words, snippets = [], []
+                    for kw in keywords:
+                        pattern = re.compile(r".{0,50}" + re.escape(kw) + r".{0,50}", re.IGNORECASE)
+                        matches = pattern.findall(text_content)
+                        if matches:
+                            found_words.append(kw)
+                            for m in matches[:3]:
+                                snippets.append(f"...{m}...")
+
+                    if found_words:
+                        results.append({
+                            "파일경로": path,
+                            "일치 키워드": ", ".join(found_words),
+                            "일치 횟수": len(snippets),
+                            "문장 일부": "\n".join(snippets)
+                        })
+    except zipfile.BadZipFile:
+        pass
+
+# ----------------------------------
+# Streamlit UI
+# ----------------------------------
 uploaded_file = st.file_uploader("📂 ZIP 파일 업로드", type=["zip"])
-keywords_input = st.text_input("🔎 검색할 키워드 (쉼표로 구분 가능)")
+keywords_input = st.text_input("🔎 검색할 키워드 (쉼표로 구분 가능)", placeholder="예: 임원, ESG, 품질, 지속가능")
 
 search_button = st.button("검색 시작 🔍")
 
-# ------------------------------
-# 검색 로직
-# ------------------------------
 if search_button:
     if not uploaded_file:
         st.warning("⚠️ ZIP 파일을 먼저 업로드하세요.")
@@ -78,43 +123,17 @@ if search_button:
     else:
         keywords = [kw.strip() for kw in keywords_input.split(",") if kw.strip()]
         results = []
-        targets = (".xml", ".xbrl", ".htm", ".html", ".txt")
+        progress = st.progress(0, text="ZIP 구조 탐색 중...")
 
-        with zipfile.ZipFile(uploaded_file, "r") as zf:
-            file_list = [n for n in zf.namelist() if n.lower().endswith(targets)]
-            progress = st.progress(0, text="검색 중...")
+        try:
+            file_bytes = uploaded_file.read()
+            extract_texts_from_zip(file_bytes, keywords, results)
+        except Exception as e:
+            st.error(f"ZIP 파일을 읽는 중 오류 발생: {e}")
 
-            for i, name in enumerate(file_list, start=1):
-                try:
-                    raw = zf.read(name)
-                except Exception:
-                    continue
-                text_content = extract_text(raw)
-                if not text_content:
-                    continue
-
-                found_words, snippets = [], []
-                for kw in keywords:
-                    pattern = re.compile(r".{0,50}" + re.escape(kw) + r".{0,50}", re.IGNORECASE)
-                    matches = pattern.findall(text_content)
-                    if matches:
-                        found_words.append(kw)
-                        for m in matches[:3]:
-                            snippets.append(f"...{m}...")
-
-                if found_words:
-                    results.append({
-                        "파일명": name,
-                        "일치 키워드": ", ".join(found_words),
-                        "일치 횟수": len(snippets),
-                        "문장 일부": "\n".join(snippets)
-                    })
-
-                progress.progress(i / len(file_list), text=f"검색 중... ({i}/{len(file_list)})")
-
-        # ------------------------------
+        # ----------------------------------
         # 결과 표시
-        # ------------------------------
+        # ----------------------------------
         if results:
             df = pd.DataFrame(results)
             st.success(f"✅ 총 {len(df)}개 문서에서 키워드 발견")

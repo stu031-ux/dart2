@@ -3,40 +3,68 @@ import zipfile, io, re
 import pandas as pd
 from bs4 import BeautifulSoup
 
-st.title("📂 ESG 관련 보고서 탐색기")
+st.set_page_config(page_title="XML 키워드 검색기", page_icon="🔍", layout="wide")
+st.title("🔍 XML ZIP 문서 키워드 검색기")
 
-keywords = ["ESG", "지속가능경영", "환경", "사회", "거버넌스",
-            "sustainability", "environment", "social", "governance"]
+st.markdown("""
+ZIP 파일 안의 XML 문서들을 모두 분석해 특정 키워드가 포함된 파일을 찾아줍니다.  
+예: `ESG`, `반도체`, `안전`, `품질`, `지속가능`, `인권` 등 자유롭게 검색 가능  
+""")
 
-uploaded_file = st.file_uploader("ZIP 파일을 업로드하세요", type=["zip"])
+uploaded_file = st.file_uploader("📂 ZIP 파일 업로드", type=["zip"])
+keywords_input = st.text_input("🔎 검색할 키워드 (쉼표로 구분 가능)", value="ESG")
 
-if uploaded_file:
+if uploaded_file and keywords_input.strip():
+    keywords = [kw.strip() for kw in keywords_input.split(",") if kw.strip()]
     results = []
+
     with zipfile.ZipFile(uploaded_file, "r") as zf:
         for name in zf.namelist():
             if not name.lower().endswith(".xml"):
                 continue
-            with zf.open(name) as fp:
-                try:
+            try:
+                with zf.open(name) as fp:
                     text = fp.read().decode("utf-8", errors="ignore")
-                except:
-                    continue
-                soup = BeautifulSoup(text, "xml")
-                text_content = soup.get_text(" ", strip=True)
-                found = [kw for kw in keywords if kw.lower() in text_content.lower()]
-                if found:
-                    # 키워드가 포함된 문장 일부 추출
-                    snippet = ""
-                    for kw in found:
-                        m = re.search(r".{0,40}" + kw + r".{0,40}", text_content, re.IGNORECASE)
-                        if m:
-                            snippet += f"...{m.group(0)}..."
-                    results.append({"파일명": name, "일치 키워드": ", ".join(found), "문장 일부": snippet})
-    
+            except Exception:
+                continue
+
+            # BeautifulSoup으로 XML 파싱 및 텍스트 추출
+            soup = BeautifulSoup(text, "xml")
+            text_content = soup.get_text(" ", strip=True)
+
+            found_words = []
+            snippets = []
+
+            for kw in keywords:
+                pattern = re.compile(r".{0,50}" + re.escape(kw) + r".{0,50}", re.IGNORECASE)
+                matches = pattern.findall(text_content)
+                if matches:
+                    found_words.append(kw)
+                    for m in matches[:3]:  # 최대 3개까지만 미리보기
+                        snippets.append(f"...{m}...")
+
+            if found_words:
+                results.append({
+                    "파일명": name,
+                    "일치 키워드": ", ".join(found_words),
+                    "일치 횟수": len(snippets),
+                    "문장 일부": "\n".join(snippets)
+                })
+
     if results:
         df = pd.DataFrame(results)
+        st.success(f"✅ 총 {len(df)}개 파일에서 키워드 발견")
         st.dataframe(df, use_container_width=True)
+
         csv = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button("📊 결과 CSV 다운로드", data=csv, file_name="esg_검색결과.csv", mime="text/csv")
+        st.download_button(
+            "📊 결과 CSV 다운로드",
+            data=csv,
+            file_name="keyword_search_results.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
     else:
-        st.warning("ESG 관련 키워드가 포함된 문서를 찾지 못했습니다.")
+        st.warning("❌ 일치하는 키워드가 포함된 문서를 찾지 못했습니다.")
+else:
+    st.info("ZIP 파일을 업로드하고 검색할 키워드를 입력하세요.")
